@@ -23,7 +23,7 @@ struct CacheEntry {
     response_body: String,
 }
 
-fn header_map_to_hash_map(headers: &HeaderMap) -> HashMap<String, String> {
+fn headers_to_hashmap(headers: &HeaderMap) -> HashMap<String, String> {
     headers
         .iter()
         .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap().to_string()))
@@ -52,22 +52,19 @@ async fn forward_request(
             .map_or(String::new(), |v| format!("?{}", v))
     );
     let new_uri: Uri = new_uri_str.parse().unwrap();
-
-    // let new_uri_str = format!("http://httpbin.org{}", req.uri().path());
-    // let new_uri: Uri = new_uri_str.parse().unwrap();
     *req.uri_mut() = new_uri.clone();
 
     let client = Client::new();
     let mut res = client.request(req).await?;
-    let mut body_bytes = hyper::body::to_bytes(res.body_mut()).await?;
+    let body_bytes = hyper::body::to_bytes(res.body_mut()).await?;
 
     let cache_entry = CacheEntry {
         complete_url: new_uri_str.clone(),
         path: path.clone(),
         method: method.to_string(),
         query_string: new_uri.query().map(|s| s.to_string()),
-        request_headers: header_map_to_hash_map(&cloned_headers), // Use the cloned headers
-        response_headers: header_map_to_hash_map(res.headers()),
+        request_headers: headers_to_hashmap(&cloned_headers), // Use the cloned headers
+        response_headers: headers_to_hashmap(res.headers()),
         response_status: res.status().as_u16(),
         response_body: String::from_utf8_lossy(&body_bytes).to_string(),
     };
