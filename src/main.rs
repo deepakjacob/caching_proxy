@@ -44,9 +44,17 @@ async fn forward_request(
             return Ok(Response::new(Body::from(cached_body.clone())));
         }
     }
-
-    let new_uri_str = format!("http://httpbin.org{}", req.uri().path());
+    let new_uri_str = format!(
+        "http://httpbin.org{}{}",
+        req.uri().path(),
+        req.uri()
+            .query()
+            .map_or(String::new(), |v| format!("?{}", v))
+    );
     let new_uri: Uri = new_uri_str.parse().unwrap();
+
+    // let new_uri_str = format!("http://httpbin.org{}", req.uri().path());
+    // let new_uri: Uri = new_uri_str.parse().unwrap();
     *req.uri_mut() = new_uri.clone();
 
     let client = Client::new();
