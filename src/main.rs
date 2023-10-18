@@ -7,23 +7,11 @@ use log::{error, info};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use tokio::sync::RwLock;
 
-// TODO: tokio has an implementation of RwLock - need to check
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
-type Cache = Arc<RwLock<HashMap<String, Bytes>>>;
-
-fn read_cache1<'a>(cache: &'a Cache, cache_key: String) -> Option<&'a Bytes> {
-    let read_guard = cache.read().unwrap();
-    //TODO: check why we need to provide the reference here?
-    // cache_key itself is &str
-    read_guard.get(&cache_key.to_lowercase())
-}
-
-fn write_cache1(cache: Cache, cache_key: &str, bytes: &Bytes) {
-    let mut write_guard = cache.write().unwrap();
-    write_guard.insert(cache_key.to_lowercase(), bytes.clone());
-}
+type Cache = RwLock<HashMap<String, Bytes>>;
 
 async fn fetch_from_server(
     forward_uri: Uri,
@@ -37,8 +25,7 @@ async fn fetch_from_server(
     // Clone all headers from the original request
     let mut req_builder = Request::builder()
         .method(original_req.method())
-        .uri(forward_uri)
-        .version(original_req.version());
+        .uri(forward_uri);
 
     let headers = req_builder.headers_mut().unwrap();
     headers.extend(original_req.headers().clone());
@@ -46,28 +33,42 @@ async fn fetch_from_server(
     // Build the new request with the new body
     let new_req = req_builder.body(new_body).unwrap();
 
+    info!("new request {:?}", new_req);
     let res = client.request(new_req).await?;
+    info!("got response {:?}", res);
     Ok(res)
 }
 
 async fn serve_from_cache_or_fallback(
-    cache: Cache,
+    cache: Arc<Cache>,
     cache_path: &str,
     forward_uri: Uri,
     original_req: Request<Body>,
 ) -> Result<Response<Body>, hyper::Error> {
-    let read_guard = cache.read().unwrap();
-    if let Some(cached_data) = read_guard.get(cache_path) {
-        info!("cache hit with the key: {:?}", &cache_path);
-        Ok(Response::new(Body::from(cached_data.clone())))
-    } else {
+    {
+        let read_guard = cache.read().await;
+        if let Some(cached_data) = read_guard.get(cache_path) {
+            info!("cache hit with the key: {:?}", &cache_path);
+            return Ok(Response::new(Body::from(cached_data.clone())));
+        }
+    }
+
+    {
+        info!("cache miss with uri: {:?}", &forward_uri);
         match fetch_from_server(forward_uri, original_req).await {
             Ok(mut original_res) => {
                 let bytes_result = hyper::body::to_bytes(original_res.body_mut()).await?;
+                info!("bytes came from response {}", bytes_result.len());
 
-                let mut write_guard = cache.write().unwrap();
+                let mut write_guard = cache.write().await;
+                info!("got the write lock");
                 write_guard.insert(cache_path.to_lowercase(), bytes_result.clone());
 
+                info!(
+                    "writing the cache ->  key {} - bytes {}",
+                    cache_path,
+                    bytes_result.len()
+                );
                 let mut new_res = Response::builder()
                     .status(original_res.status())
                     .version(original_res.version())
@@ -75,7 +76,6 @@ async fn serve_from_cache_or_fallback(
                     .unwrap();
 
                 *new_res.headers_mut() = original_res.headers().clone();
-
                 Ok(new_res)
             }
             Err(_) => {
@@ -93,12 +93,12 @@ async fn serve_from_cache_or_fallback(
 async fn main() {
     env_logger::init();
 
-    let cache = Arc::new(RwLock::new(HashMap::new()));
-    let service = make_service_fn(move |_conn| {
+    let cache: Arc<Cache> = Arc::new(RwLock::new(HashMap::new()));
+    let service = make_service_fn(move |_| {
         let cache = cache.clone();
-        async { Ok::<_, hyper::Error>(service_fn(move |req| proxy(cache, req))) }
+        async { Ok::<_, hyper::Error>(service_fn(move |req| proxy(cache.clone(), req))) }
     });
-    let addr = ([127, 0, 0, 1], 3000).into();
+    let addr = ([127, 0, 0, 1], 8080).into();
     let server = Server::bind(&addr).serve(service);
 
     info!("Server running on http://{}", addr);
@@ -107,7 +107,8 @@ async fn main() {
         eprintln!("server error: {}", e);
     }
 }
-async fn proxy(cache: Cache, req: Request<Body>) -> Result<Response<Body>, hyper::Error> {
+async fn proxy(cache: Arc<Cache>, req: Request<Body>) -> Result<Response<Body>, hyper::Error> {
+    info!("\n\n---------------------------------------------------------------------------");
     info!("Received a new request: {:?}", req);
     let path_and_query = match req.uri().path_and_query() {
         Some(pq) => pq.to_string(),
@@ -117,9 +118,10 @@ async fn proxy(cache: Cache, req: Request<Body>) -> Result<Response<Body>, hyper
     let forward_uri: Uri = format!("http://localhost:3000{}", path_and_query)
         .parse()
         .unwrap();
-
+    info!("the forward uri: {:?}", forward_uri);
     let hash_code = compute_hash(&forward_uri.to_string().to_lowercase());
     let cache_key = format!("{}", hash_code);
+    info!("forwarding the request, cache key: {:?}", &cache_key);
     serve_from_cache_or_fallback(cache, &cache_key, forward_uri, req).await
 }
 
