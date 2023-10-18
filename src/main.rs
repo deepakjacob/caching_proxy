@@ -2,7 +2,7 @@ use env_logger;
 use hyper::body::Bytes;
 use hyper::http::StatusCode;
 use hyper::service::{make_service_fn, service_fn};
-use hyper::{Body, Client, Request, Response, Server, Uri};
+use hyper::{Body, Client, HeaderMap, Request, Response, Server, Uri};
 use log::{error, info};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
@@ -11,7 +11,12 @@ use tokio::sync::RwLock;
 
 use std::sync::Arc;
 
-type Cache = RwLock<HashMap<String, Bytes>>;
+#[derive(Debug)]
+struct ResponseEntry {
+    headers: HeaderMap,
+    body: Bytes,
+}
+type Cache = RwLock<HashMap<String, ResponseEntry>>;
 
 async fn fetch_from_server(
     forward_uri: Uri,
@@ -48,8 +53,12 @@ async fn serve_from_cache_or_fallback(
     {
         let read_guard = cache.read().await;
         if let Some(cached_data) = read_guard.get(cache_path) {
-            info!("cache hit with the key: {:?}", &cache_path);
-            return Ok(Response::new(Body::from(cached_data.clone())));
+            info!("cache hit with the key: {:?}", &cache_path.to_lowercase());
+            let mut new_res = Response::builder()
+                .body(Body::from(cached_data.body.clone()))
+                .unwrap();
+            *new_res.headers_mut() = cached_data.headers.clone();
+            return Ok(new_res);
         }
     }
 
@@ -62,7 +71,11 @@ async fn serve_from_cache_or_fallback(
 
                 let mut write_guard = cache.write().await;
                 info!("got the write lock");
-                write_guard.insert(cache_path.to_lowercase(), bytes_result.clone());
+                let response_entry = ResponseEntry {
+                    headers: original_res.headers().clone(),
+                    body: bytes_result.clone(),
+                };
+                write_guard.insert(cache_path.to_lowercase(), response_entry);
 
                 info!(
                     "writing the cache ->  key {} - bytes {}",
@@ -74,7 +87,7 @@ async fn serve_from_cache_or_fallback(
                     .version(original_res.version())
                     .body(Body::from(bytes_result.clone()))
                     .unwrap();
-
+                // let h = original_res.headers().clone();
                 *new_res.headers_mut() = original_res.headers().clone();
                 Ok(new_res)
             }
