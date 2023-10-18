@@ -53,7 +53,11 @@ async fn serve_from_cache_or_fallback(
     {
         let read_guard = cache.read().await;
         if let Some(cached_data) = read_guard.get(cache_path) {
-            info!("cache hit with the key: {:?}", &cache_path.to_lowercase());
+            info!(
+                "cache exists for the url: {:?} - key {:?}",
+                forward_uri,
+                &cache_path.to_lowercase()
+            );
             let mut new_res = Response::builder()
                 .body(Body::from(cached_data.body.clone()))
                 .unwrap();
@@ -134,7 +138,7 @@ async fn proxy(cache: Arc<Cache>, req: Request<Body>) -> Result<Response<Body>, 
     info!("the forward uri: {:?}", forward_uri);
     let hash_code = compute_hash(&forward_uri.to_string().to_lowercase());
     let cache_key = format!("{}", hash_code);
-    info!("forwarding the request, cache key: {:?}", &cache_key);
+    info!("generated cache key: {:?}", &cache_key);
     serve_from_cache_or_fallback(cache, &cache_key, forward_uri, req).await
 }
 
