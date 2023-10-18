@@ -1,37 +1,28 @@
 use env_logger;
+use hyper::body::Bytes;
 use hyper::http::StatusCode;
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Client, Request, Response, Server, Uri};
 use log::{error, info};
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::path::Path;
-use tokio::fs::File;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-async fn read_cache(cache_file_path: &Path) -> Option<Vec<u8>> {
-    if let Ok(mut file) = File::open(cache_file_path).await {
-        let mut buffer = Vec::new();
-        if file.read_to_end(&mut buffer).await.is_ok() {
-            return Some(buffer);
-        }
-    }
-    None
+// TODO: tokio has an implementation of RwLock - need to check
+use std::sync::{Arc, RwLock};
+
+type Cache = Arc<RwLock<HashMap<String, Bytes>>>;
+
+fn read_cache1<'a>(cache: &'a Cache, cache_key: String) -> Option<&'a Bytes> {
+    let read_guard = cache.read().unwrap();
+    //TODO: check why we need to provide the reference here?
+    // cache_key itself is &str
+    read_guard.get(&cache_key.to_lowercase())
 }
 
-async fn write_cache(cache_file_path: &Path, data: &[u8]) {
-    info!("the size of data to be writtin is {:?}", data.len());
-    if let Ok(mut file) = File::create(cache_file_path).await {
-        if file.write_all(data).await.is_err() {
-            error!("Failed to write to cache file.");
-        }
-    }
-}
-
-fn compute_hash<T: Hash>(data: &T) -> String {
-    let mut s = DefaultHasher::new();
-    data.hash(&mut s);
-    s.finish().to_string()
+fn write_cache1(cache: Cache, cache_key: &str, bytes: &Bytes) {
+    let mut write_guard = cache.write().unwrap();
+    write_guard.insert(cache_key.to_lowercase(), bytes.clone());
 }
 
 async fn fetch_from_server(
@@ -39,7 +30,6 @@ async fn fetch_from_server(
     mut original_req: Request<Body>,
 ) -> Result<Response<Body>, hyper::Error> {
     let client = Client::new();
-
     // Convert the original body to bytes
     let original_body_bytes = hyper::body::to_bytes(original_req.body_mut()).await?;
     let new_body = Body::from(original_body_bytes.clone());
@@ -61,19 +51,22 @@ async fn fetch_from_server(
 }
 
 async fn serve_from_cache_or_fallback(
-    cache_file_path: &Path,
+    cache: Cache,
+    cache_path: &str,
     forward_uri: Uri,
     original_req: Request<Body>,
 ) -> Result<Response<Body>, hyper::Error> {
-    if let Some(cached_data) = read_cache(cache_file_path).await {
-        info!("cache hit with the key: {:?}", &cache_file_path);
-        println!("cache hit with the key: {:?}", &cache_file_path);
-        Ok(Response::new(Body::from(cached_data)))
+    let read_guard = cache.read().unwrap();
+    if let Some(cached_data) = read_guard.get(cache_path) {
+        info!("cache hit with the key: {:?}", &cache_path);
+        Ok(Response::new(Body::from(cached_data.clone())))
     } else {
         match fetch_from_server(forward_uri, original_req).await {
             Ok(mut original_res) => {
                 let bytes_result = hyper::body::to_bytes(original_res.body_mut()).await?;
-                write_cache(cache_file_path, &bytes_result).await;
+
+                let mut write_guard = cache.write().unwrap();
+                write_guard.insert(cache_path.to_lowercase(), bytes_result.clone());
 
                 let mut new_res = Response::builder()
                     .status(original_res.status())
@@ -96,9 +89,26 @@ async fn serve_from_cache_or_fallback(
     }
 }
 
-async fn handle_request(req: Request<Body>) -> Result<Response<Body>, hyper::Error> {
-    info!("Received a new request: {:?}", req);
+#[tokio::main]
+async fn main() {
+    env_logger::init();
 
+    let cache = Arc::new(RwLock::new(HashMap::new()));
+    let service = make_service_fn(move |_conn| {
+        let cache = cache.clone();
+        async { Ok::<_, hyper::Error>(service_fn(move |req| proxy(cache, req))) }
+    });
+    let addr = ([127, 0, 0, 1], 3000).into();
+    let server = Server::bind(&addr).serve(service);
+
+    info!("Server running on http://{}", addr);
+
+    if let Err(e) = server.await {
+        eprintln!("server error: {}", e);
+    }
+}
+async fn proxy(cache: Cache, req: Request<Body>) -> Result<Response<Body>, hyper::Error> {
+    info!("Received a new request: {:?}", req);
     let path_and_query = match req.uri().path_and_query() {
         Some(pq) => pq.to_string(),
         None => String::from("/"),
@@ -108,26 +118,13 @@ async fn handle_request(req: Request<Body>) -> Result<Response<Body>, hyper::Err
         .parse()
         .unwrap();
 
-    let hash_code = compute_hash(&forward_uri.to_string());
-
-    let cache_path = format!("cache_{}", hash_code);
-    let cache_file_path = Path::new(&cache_path);
-
-    serve_from_cache_or_fallback(&cache_file_path, forward_uri, req).await
+    let hash_code = compute_hash(&forward_uri.to_string().to_lowercase());
+    let cache_key = format!("{}", hash_code);
+    serve_from_cache_or_fallback(cache, &cache_key, forward_uri, req).await
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    env_logger::init();
-
-    let addr = "127.0.0.1:8080".parse()?;
-    let service =
-        make_service_fn(|_conn| async { Ok::<_, hyper::Error>(service_fn(handle_request)) });
-    let server = Server::bind(&addr).serve(service);
-
-    info!("Server running on http://{}", addr);
-
-    server.await?;
-
-    Ok(())
+fn compute_hash<T: Hash>(data: &T) -> String {
+    let mut s = DefaultHasher::new();
+    data.hash(&mut s);
+    s.finish().to_string()
 }
