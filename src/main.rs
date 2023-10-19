@@ -85,14 +85,14 @@ async fn serve_from_cache_or_fallback(
                 info!("response bytes length {}", &bytes_result.len());
                 if !bytes_result.is_empty() {
                     let mut write_guard = cache.write().await;
-                    info!("got the write lock");
+                    debug!("got the write lock");
                     let response_entry = ResponseEntry {
                         headers: original_res.headers().clone(),
                         body: bytes_result.clone(),
                     };
                     write_guard.insert(cache_path.to_lowercase(), response_entry);
 
-                    info!(
+                    debug!(
                         "written to cache key {} - bytes {}",
                         cache_path,
                         bytes_result.len()
@@ -105,18 +105,19 @@ async fn serve_from_cache_or_fallback(
                     };
                     debug!("creation of in memory file entry successful");
                     let encoded: Vec<u8> = serialize(&file_entry).unwrap();
-
                     debug!("serialized struct into Vec<u8> - {:?}", encoded.len());
+                    tokio::fs::create_dir_all("cache").await.unwrap();
                     // Asynchronously write to a file
-                    let mut file = File::create(cache_path).await.unwrap();
-
-                    debug!("created file with name {}", cache_path);
+                    let file_path = format!("cache/{cache_path}");
+                    debug!("the file path is {file_path}");
+                    let mut file = File::create(&file_path).await.unwrap();
+                    debug!("created file with name {}", file_path);
                     file.write_all(&encoded).await.unwrap();
 
-                    debug!("writing file success!");
+                    info!("writing cache into file://{cache_path} system success!");
                     // --------------- file system write end -------------
                 } else {
-                    info!("caching not attempted as response appears to be empty!");
+                    info!("caching not attempted as response is empty!");
                 }
 
                 let mut new_res = Response::builder()
@@ -144,6 +145,7 @@ async fn main() {
     env_logger::init();
 
     let cache: Arc<Cache> = Arc::new(RwLock::new(HashMap::new()));
+
     let service = make_service_fn(move |_| {
         let cache = cache.clone();
         async { Ok::<_, hyper::Error>(service_fn(move |req| proxy(cache.clone(), req))) }
