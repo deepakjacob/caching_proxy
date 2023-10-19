@@ -1,12 +1,16 @@
+use bincode::serialize;
 use env_logger;
 use hyper::body::Bytes;
 use hyper::http::StatusCode;
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Client, HeaderMap, Request, Response, Server, Uri};
-use log::{error, info};
+use log::{debug, error, info};
+use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use tokio::fs::File;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::RwLock;
 
 use std::sync::Arc;
@@ -16,6 +20,13 @@ struct ResponseEntry {
     headers: HeaderMap,
     body: Bytes,
 }
+
+#[derive(Debug, Serialize, Deserialize)]
+struct FileEntry {
+    headers: HashMap<String, String>,
+    body: Vec<u8>,
+}
+
 type Cache = RwLock<HashMap<String, ResponseEntry>>;
 
 async fn fetch_from_server(
@@ -71,21 +82,43 @@ async fn serve_from_cache_or_fallback(
         match fetch_from_server(forward_uri, original_req).await {
             Ok(mut original_res) => {
                 let bytes_result = hyper::body::to_bytes(original_res.body_mut()).await?;
-                info!("bytes came from response {}", bytes_result.len());
+                info!("response bytes length {}", &bytes_result.len());
+                if !bytes_result.is_empty() {
+                    let mut write_guard = cache.write().await;
+                    info!("got the write lock");
+                    let response_entry = ResponseEntry {
+                        headers: original_res.headers().clone(),
+                        body: bytes_result.clone(),
+                    };
+                    write_guard.insert(cache_path.to_lowercase(), response_entry);
 
-                let mut write_guard = cache.write().await;
-                info!("got the write lock");
-                let response_entry = ResponseEntry {
-                    headers: original_res.headers().clone(),
-                    body: bytes_result.clone(),
-                };
-                write_guard.insert(cache_path.to_lowercase(), response_entry);
+                    info!(
+                        "written to cache key {} - bytes {}",
+                        cache_path,
+                        bytes_result.len()
+                    );
 
-                info!(
-                    "writing the cache ->  key {} - bytes {}",
-                    cache_path,
-                    bytes_result.len()
-                );
+                    // -------------- file system write start ------------
+                    let file_entry = FileEntry {
+                        headers: header_map_to_hash_map(&original_res.headers()),
+                        body: bytes_result.clone().to_vec(),
+                    };
+                    debug!("creation of in memory file entry successful");
+                    let encoded: Vec<u8> = serialize(&file_entry).unwrap();
+
+                    debug!("serialized struct into Vec<u8> - {:?}", encoded.len());
+                    // Asynchronously write to a file
+                    let mut file = File::create(cache_path).await.unwrap();
+
+                    debug!("created file with name {}", cache_path);
+                    file.write_all(&encoded).await.unwrap();
+
+                    debug!("writing file success!");
+                    // --------------- file system write end -------------
+                } else {
+                    info!("caching not attempted as response appears to be empty!");
+                }
+
                 let mut new_res = Response::builder()
                     .status(original_res.status())
                     .version(original_res.version())
@@ -146,4 +179,12 @@ fn compute_hash<T: Hash>(data: &T) -> String {
     let mut s = DefaultHasher::new();
     data.hash(&mut s);
     s.finish().to_string()
+}
+
+// Convert hyper::HeaderMap to HashMap<String, String>
+fn header_map_to_hash_map(header_map: &HeaderMap) -> HashMap<String, String> {
+    header_map
+        .iter()
+        .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap().to_string()))
+        .collect()
 }
