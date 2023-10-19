@@ -1,7 +1,7 @@
-use bincode::serialize;
+use bincode::{deserialize, serialize};
 use env_logger;
 use hyper::body::Bytes;
-use hyper::http::StatusCode;
+use hyper::http::{HeaderName, HeaderValue, StatusCode};
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Client, HeaderMap, Request, Response, Server, Uri};
 use log::{debug, error, info};
@@ -9,11 +9,12 @@ use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use tokio::fs::File;
-use tokio::io::AsyncWriteExt;
-use tokio::sync::RwLock;
-
+use std::io::Error as IoError;
+use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::fs::{read_dir, File};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::RwLock;
 
 #[derive(Debug)]
 struct ResponseEntry {
@@ -108,7 +109,7 @@ async fn serve_from_cache_or_fallback(
                     debug!("serialized struct into Vec<u8> - {:?}", encoded.len());
                     tokio::fs::create_dir_all("cache").await.unwrap();
                     // Asynchronously write to a file
-                    let file_path = format!("cache/{cache_path}");
+                    let file_path = format!("cache/{cache_path}.bin");
                     debug!("the file path is {file_path}");
                     let mut file = File::create(&file_path).await.unwrap();
                     debug!("created file with name {}", file_path);
@@ -146,6 +147,8 @@ async fn main() {
 
     let cache: Arc<Cache> = Arc::new(RwLock::new(HashMap::new()));
 
+    _ = read_fs_into_cache(cache.clone()).await;
+
     let service = make_service_fn(move |_| {
         let cache = cache.clone();
         async { Ok::<_, hyper::Error>(service_fn(move |req| proxy(cache.clone(), req))) }
@@ -160,7 +163,7 @@ async fn main() {
     }
 }
 async fn proxy(cache: Arc<Cache>, req: Request<Body>) -> Result<Response<Body>, hyper::Error> {
-    info!("\n\n---------------------------------------------------------------------------");
+    info!("---------------------------------------------------------------------------");
     info!("Received a new request: {:?}", req);
     let path_and_query = match req.uri().path_and_query() {
         Some(pq) => pq.to_string(),
@@ -177,6 +180,43 @@ async fn proxy(cache: Arc<Cache>, req: Request<Body>) -> Result<Response<Body>, 
     serve_from_cache_or_fallback(cache, &cache_key, forward_uri, req).await
 }
 
+async fn read_fs_into_cache(cache: Arc<Cache>) -> Result<(), IoError> {
+    debug!("attempting to read cache files");
+    let mut dir = read_dir("cache").await?;
+    while let Some(entry) = dir.next_entry().await? {
+        debug!("reading fs cache file: {:?}", entry);
+        let path: PathBuf = entry.path();
+        let path_clone = path.clone();
+        if path.extension().unwrap_or_default() == "bin" {
+            let decoded: FileEntry = read_and_deserialize_file(path).await.unwrap();
+            debug!("Decoded struct body from fs len: {:?}", decoded.body.len());
+            {
+                let mut write_guard = cache.write().await;
+                debug!("got the write lock for writing from fs to cache");
+                let response_entry = ResponseEntry {
+                    headers: convert_hashmap_to_headermap(decoded.headers).unwrap(),
+                    body: Bytes::from(decoded.body),
+                };
+                if let Some(stem) = path_clone.file_stem() {
+                    if let Some(stem_str) = stem.to_str() {
+                        debug!("inserting cache entry: {}", stem_str);
+                        write_guard.insert(stem_str.to_lowercase(), response_entry);
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn read_and_deserialize_file(path: PathBuf) -> Result<FileEntry, IoError> {
+    let mut file = File::open(path).await.unwrap();
+    let mut buffer = Vec::new();
+    file.read_to_end(&mut buffer).await.unwrap();
+    let decoded: FileEntry = deserialize(&buffer).unwrap();
+    Ok(decoded)
+}
+
 fn compute_hash<T: Hash>(data: &T) -> String {
     let mut s = DefaultHasher::new();
     data.hash(&mut s);
@@ -189,4 +229,16 @@ fn header_map_to_hash_map(header_map: &HeaderMap) -> HashMap<String, String> {
         .iter()
         .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap().to_string()))
         .collect()
+}
+
+fn convert_hashmap_to_headermap(
+    hash_map: HashMap<String, String>,
+) -> Result<HeaderMap, hyper::http::Error> {
+    let mut header_map = HeaderMap::new();
+    for (k, v) in hash_map {
+        let key = HeaderName::try_from(k)?;
+        let value = HeaderValue::try_from(v)?;
+        header_map.insert(key, value);
+    }
+    Ok(header_map)
 }
