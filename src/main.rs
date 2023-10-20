@@ -99,24 +99,7 @@ async fn serve_from_cache_or_fallback(
                     bytes_result.len()
                 );
 
-                // -------------- file system write start ------------
-                let file_entry = FileEntry {
-                    headers: header_map_to_hash_map(&original_res.headers()),
-                    body: bytes_result.clone().to_vec(),
-                };
-                debug!("creation of in memory file entry successful");
-                let encoded: Vec<u8> = serialize(&file_entry).unwrap();
-                debug!("serialized struct into Vec<u8> - {:?}", encoded.len());
-                tokio::fs::create_dir_all("cache").await.unwrap();
-                // Asynchronously write to a file
-                let file_path = format!("cache/{cache_path}.bin");
-                debug!("the file path is {file_path}");
-                let mut file = File::create(&file_path).await.unwrap();
-                debug!("created file with name {}", file_path);
-                file.write_all(&encoded).await.unwrap();
-
-                info!("writing cache into file://{cache_path} system success!");
-                // --------------- file system write end -------------
+                _ = write_cache_to_fs(&original_res, &bytes_result, cache_path).await;
 
                 if !bytes_result.is_empty() {
                     debug!("caching an empty response for {:?}", path_and_query);
@@ -141,7 +124,27 @@ async fn serve_from_cache_or_fallback(
         }
     }
 }
-/// the 🐶 caching proxy
+
+async fn write_cache_to_fs(original_res: &Response<Body>, bytes_result: &Bytes, cache_path: &str) {
+    let file_entry = FileEntry {
+        headers: header_map_to_hash_map(&original_res.headers()),
+        body: bytes_result.clone().to_vec(),
+    };
+    debug!("creation of in memory file entry successful");
+    let encoded: Vec<u8> = serialize(&file_entry).unwrap();
+    debug!("serialized struct into Vec<u8> - {:?}", encoded.len());
+    tokio::fs::create_dir_all("cache").await.unwrap();
+    // Asynchronously write to a file
+    let file_path = format!("cache/{cache_path}.bin");
+    debug!("the file path is {file_path}");
+    let mut file = File::create(&file_path).await.unwrap();
+    debug!("created file with name {}", file_path);
+    file.write_all(&encoded).await.unwrap();
+
+    info!("writing cache into file://{cache_path} system success!");
+}
+
+/// the caching proxy
 #[tokio::main]
 async fn main() {
     env_logger::init();
@@ -164,8 +167,7 @@ async fn main() {
     }
 }
 async fn proxy(cache: Arc<Cache>, req: Request<Body>) -> Result<Response<Body>, hyper::Error> {
-    info!("---------------------------------------------------------------------------");
-    info!("Received a new request: {:?}", req);
+    info!("received a new request: {:?}", req);
     let path_and_query = match req.uri().path_and_query() {
         Some(pq) => pq.to_string(),
         None => String::from("/"),
@@ -174,10 +176,10 @@ async fn proxy(cache: Arc<Cache>, req: Request<Body>) -> Result<Response<Body>, 
     let forward_uri: Uri = format!("http://localhost:3000{}", path_and_query)
         .parse()
         .unwrap();
-    info!("the forward uri: {:?}", forward_uri);
+    debug!("the forward uri: {:?}", forward_uri);
     let hash_code = compute_hash(&forward_uri.to_string().to_lowercase());
     let cache_key = format!("{}", hash_code);
-    info!("generated cache key: {:?}", &cache_key);
+    debug!("generated cache key: {:?}", &cache_key);
     serve_from_cache_or_fallback(cache, &cache_key, forward_uri, req, &path_and_query).await
 }
 
@@ -190,7 +192,7 @@ async fn read_fs_into_cache(cache: Arc<Cache>) -> Result<(), IoError> {
         let path_clone = path.clone();
         if path.extension().unwrap_or_default() == "bin" {
             let decoded: FileEntry = read_and_deserialize_file(path).await.unwrap();
-            debug!("Decoded struct body from fs len: {:?}", decoded.body.len());
+            debug!("decoded struct body, len: {:?}", decoded.body.len());
             {
                 let mut write_guard = cache.write().await;
                 debug!("got the write lock for writing from fs to cache");
